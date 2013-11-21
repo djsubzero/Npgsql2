@@ -104,10 +104,15 @@ namespace Npgsql
 
         private ConnectionState _connection_state;
 
-        // The physical network connection to the backend.
-        private Stream _stream;
-
+        // The physical network connection socket and stream to the backend.
         private Socket _socket;
+        private NpgsqlNetworkStream _baseStream;
+
+        // The top level stream to the backend.
+        // This is a BufferedStream.
+        // With SSL, this stream sits on top of the SSL stream, which sits on top of _baseStream.
+        // Otherwise, this stream sits directly on top of _baseStream.
+        private BufferedStream _stream;
 
         // Mediator which will hold data generated from backend.
         private readonly NpgsqlMediator _mediator;
@@ -146,8 +151,8 @@ namespace Npgsql
         private Int32 _planIndex;
         private Int32 _portalIndex;
 
-        private const String _planNamePrefix = "npgsqlplan";
-        private const String _portalNamePrefix = "npgsqlportal";
+        private const String _planNamePrefix = "s";
+        private const String _portalNamePrefix = "p";
 
         private NativeToBackendTypeConverterOptions _NativeToBackendTypeConverterOptions;
 
@@ -208,6 +213,7 @@ namespace Npgsql
             _portalIndex = 0;
             _notificationThreadStopCount = 1;
         }
+
 
         //Finalizer should never be used, but if some incident has left to a connector being abandoned (most likely
         //case being a user not cleaning up a connection properly) then this way we can at least reduce the damage.
@@ -282,6 +288,11 @@ namespace Npgsql
             get { return settings.IntegratedSecurity; }
         }
 
+        internal Boolean AlwaysPrepare
+        {
+            get { return SupportsPrepare && settings.AlwaysPrepare; }
+        }
+
         /// <summary>
         /// Gets the current state of the connection.
         /// </summary>
@@ -305,24 +316,9 @@ namespace Npgsql
             get { return settings.ConnectionString; }
         }
 
-        // State
-        internal void Query(NpgsqlCommand queryCommand)
+        internal void Query(NpgsqlQuery query)
         {
-            CurrentState.Query(this, queryCommand);
-        }
-
-        internal IEnumerable<IServerResponseObject> QueryEnum(NpgsqlCommand queryCommand)
-        {
-            if (CurrentReader != null)
-            {
-                if (!CurrentReader._cleanedUp)
-                {
-                    throw new InvalidOperationException(
-                        "There is already an open DataReader associated with this Command which must be closed first.");
-                }
-                CurrentReader.Close();
-            }
-            return CurrentState.QueryEnum(this, queryCommand);
+            CurrentState.Query(this, query);
         }
 
         internal void Authenticate(byte[] password)
@@ -335,19 +331,14 @@ namespace Npgsql
             CurrentState.Parse(this, parse);
         }
 
-        internal void Flush()
-        {
-            CurrentState.Flush(this);
-        }
-
         internal void TestConnector()
         {
             CurrentState.TestConnector(this);
         }
 
-        internal NpgsqlRowDescription Sync()
+        internal void Sync()
         {
-            return CurrentState.Sync(this);
+            CurrentState.Sync(this);
         }
 
         internal void Bind(NpgsqlBind bind)
@@ -365,9 +356,14 @@ namespace Npgsql
             CurrentState.Execute(this, execute);
         }
 
-        internal IEnumerable<IServerResponseObject> ExecuteEnum(NpgsqlExecute execute)
+        internal void ProcessAndDiscardBackendResponses()
         {
-            return CurrentState.ExecuteEnum(this, execute);
+            CurrentState.ProcessAndDiscardBackendResponses(this);
+        }
+
+        internal IEnumerable<IServerResponseObject> ProcessBackendResponsesEnum()
+        {
+            return CurrentState.ProcessBackendResponsesEnum(this);
         }
 
         /// <summary>
@@ -437,7 +433,7 @@ namespace Npgsql
         {
             using (NpgsqlCommand cmd = new NpgsqlCommand("DISCARD ALL", this))
             {
-                Query(cmd);
+                cmd.ExecuteBlind();
             }
 
             // The initial connection parameters will be restored via IsValid() when get connector from pool later 
@@ -448,7 +444,7 @@ namespace Npgsql
             //Query(new NpgsqlCommand("unlisten *", this));
             using(NpgsqlCommand cmd = new NpgsqlCommand("unlisten *", this))
             {
-                Query(cmd);
+                cmd.ExecuteBlind();
             }
         }
 
@@ -468,7 +464,7 @@ namespace Npgsql
                         //Query(new NpgsqlCommand(String.Format("deallocate \"{0}\";", _planNamePrefix + i), this));
                         using(NpgsqlCommand cmd = new NpgsqlCommand(String.Format("deallocate \"{0}\";", _planNamePrefix + i.ToString()), this))
                         {
-                            Query(cmd);
+                            cmd.ExecuteBlind();
                         }
                     }
 
@@ -570,7 +566,7 @@ namespace Npgsql
         /// <summary>
         /// Default SSL ValidateRemoteCertificateCallback implementation.
         /// </summary>
-        internal bool DefaultValidateRemoteCertificateCallback(X509Certificate cert, X509Chain chain, SslPolicyErrors errors)
+        internal bool DefaultValidateRemoteCertificateCallback(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors)
         {
             if (ValidateRemoteCertificateCallback != null)
             {
@@ -601,21 +597,30 @@ namespace Npgsql
         }
 
         /// <summary>
-        /// The physical connection stream to the backend.
-        /// </summary>
-        internal Stream Stream
-        {
-            get { return _stream; }
-            set { _stream = value; }
-        }
-
-        /// <summary>
         /// The physical connection socket to the backend.
         /// </summary>
         internal Socket Socket
         {
             get { return _socket; }
             set { _socket = value; }
+        }
+
+        /// <summary>
+        /// The physical connection stream to the backend.
+        /// </summary>
+        internal NpgsqlNetworkStream BaseStream
+        {
+            get { return _baseStream; }
+            set { _baseStream = value; }
+        }
+
+        /// <summary>
+        /// The top level stream to the backend.
+        /// </summary>
+        internal BufferedStream Stream
+        {
+            get { return _stream; }
+            set { _stream = value; }
         }
 
         /// <summary>
@@ -797,6 +802,17 @@ namespace Npgsql
             }
             catch (NpgsqlException ne)
             {
+                if (_stream != null)
+                {
+                    try
+                    {
+                        _stream.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
+
                 connectTimeRemaining -= Convert.ToInt32((DateTime.Now - attemptStart).TotalMilliseconds);
 
                 // Check for protocol not supported.  If we have been told what protocol to use,
@@ -833,6 +849,9 @@ namespace Npgsql
             // Change the state of connection to open and ready.
             _connection_state = ConnectionState.Open;
             CurrentState = NpgsqlReadyState.Instance;
+
+            // After attachment, the stream will close the connector (this) when the stream gets disposed.
+            _baseStream.AttachConnector(this);
 
             // Fall back to the old way, SELECT VERSION().
             // This should not happen for protocol version 3+.
@@ -1017,7 +1036,7 @@ namespace Npgsql
         ///</summary>
         internal String NextPortalName()
         {
-            return _portalNamePrefix + Interlocked.Increment(ref _portalIndex).ToString();
+            return _portalNamePrefix + (++_portalIndex).ToString();
         }
 
         ///<summary>
@@ -1025,7 +1044,7 @@ namespace Npgsql
         ///</summary>
         internal String NextPlanName()
         {
-            return _planNamePrefix + Interlocked.Increment(ref _planIndex).ToString();
+            return _planNamePrefix + (++_planIndex).ToString();
         }
 
         internal void RemoveNotificationThread()
@@ -1154,7 +1173,7 @@ namespace Npgsql
                             {
                                 // reset any responses just before getting new ones
                                 this.connector.Mediator.ResetResponses();
-                                this.state.ProcessBackendResponses(this.connector);
+                                this.connector.ProcessAndDiscardBackendResponses();
                             }
                         }
                     }
